@@ -1,6 +1,6 @@
 # Arquitectura
 
-Propuesta de arquitectura del módulo de Ventas Virtuales. Está sujeta a los estándares que se definan para todo el ERP y a los acuerdos con los demás módulos.
+Propuesta de arquitectura del módulo de Ventas Virtuales. Está sujeta a los estándares que se definan para todo el ERP y a los acuerdos con los demás módulos. Los nombres de tablas, campos y reglas siguen el **diccionario de datos** del módulo ([`diccionario-de-datos.xlsx`](diccionario-de-datos.xlsx)).
 
 ## 1. Contexto del módulo dentro del ERP
 
@@ -46,15 +46,15 @@ flowchart TB
     end
     subgraph A["API · backend/ (Django REST Framework)"]
         direction LR
-        V["Views / ViewSets<br/>endpoints REST"] --> SE["Serializers<br/>validación (RNF-02, RNF-03)"] --> M["Models<br/>Pedido · Detalle · Estado"]
-        I["Clientes de integración<br/>Almacén, Caja, Distribución…"]
+        V["Views / ViewSets<br/>endpoints REST"] --> SE["Serializers<br/>validación (RNF-02, RNF-03)"] --> M["Models (ORM)<br/>Pedido · Detalle · Historial · Ref. externa"]
+        I["Clientes de integración<br/>Almacén, Caja, Comprobantes, Distribución"]
         V --> I
     end
     subgraph D["Datos"]
         PG[("PostgreSQL")]
     end
     P --> S -- "REST / JSON" --> A
-    M --> PG
+    M -- "transaction.atomic" --> PG
 ```
 
 | Capa | Responsabilidad | Tecnología |
@@ -63,7 +63,9 @@ flowchart TB
 | Servicios de cliente | Llamadas HTTP y tipado de las respuestas | Axios |
 | API | Endpoints, validaciones, reglas de negocio, autorización (RNF-04) | Django REST Framework |
 | Integración | Consumo de las APIs de otros módulos según contratos acordados (RNF-05) | DRF / `requests` |
-| Datos | Persistencia de los registros propios del módulo | PostgreSQL |
+| Datos | Persistencia de los registros propios del módulo | PostgreSQL (ORM de Django con migraciones) |
+
+El backend es la única capa que accede a la base de datos. Los recursos de otros módulos no se copian: solo se guarda su identificador en `I1T_REF_EXTERNA`.
 
 ## 3. Flujo del pedido virtual
 
@@ -79,111 +81,152 @@ sequenceDiagram
     participant DIS as Distribución
 
     C->>FE: Consulta catálogo
-    FE->>BE: GET /productos
+    FE->>BE: GET /api/productos/
     BE->>ALM: Consulta artículos y disponibilidad
     ALM-->>BE: Artículos, unidad de medida, stock
     BE-->>FE: Lista de productos
     C->>FE: Agrega productos al carrito
     FE->>FE: Calcula subtotales y total
-    C->>FE: Confirma pedido (cliente, dirección)
-    FE->>BE: POST /pedidos
-    BE->>BE: Valida datos y registra Pedido + Detalle (estado: REGISTRADO)
+    C->>FE: Confirma pedido (cliente, dirección, medio de pago, comprobante)
+    FE->>BE: POST /api/pedidos/ (con PedSolCod)
+    BE->>BE: Valida y registra Pedido + Detalle + Historial en una transacción (estado: REGISTRADO)
     BE-->>FE: Pedido creado
     BE->>CAJ: Referencia del pedido, importe, medio de pago
     CAJ-->>BE: Pago confirmado (estado: PAGADO)
+    BE->>ALM: Productos y cantidades del pedido
+    ALM-->>BE: Stock reservado (estado: RESERVADO)
     BE->>COM: Datos de la operación confirmada
     COM-->>BE: Comprobante emitido
     BE->>DIS: Pedido y dirección de entrega
-    DIS-->>BE: Estado del envío (EN_DESPACHO / ENTREGADO)
+    DIS-->>BE: Estado del envío (EN_ENVIO / ENTREGADO)
     C->>FE: Consulta estado del pedido
-    FE->>BE: GET /pedidos/{id}
+    FE->>BE: GET /api/pedidos/{id}/
     BE-->>FE: Estado actual e historial
 ```
 
-> El orden definitivo de pago, comprobante y despacho se establecerá por acuerdo entre los módulos.
+> El orden definitivo de pago, reserva, comprobante y despacho se establecerá por acuerdo entre los módulos. Cada respuesta externa se guarda en `I1T_REF_EXTERNA` (`RESERVA_ALM`, `PAGO_CAJA`, `COMPROBANTE`, `ENVIO_DIST`, `ASIENTO_FIN`).
 
-## 4. Estados del pedido (propuesta)
+## 4. Estados del pedido
+
+Estados definidos en el diccionario (`PedEstAct`, controlado con CHECK). Cada cambio genera un registro en `I1T_PEDIDO_EST_HIS`.
 
 ```mermaid
 stateDiagram-v2
     [*] --> REGISTRADO
     REGISTRADO --> PAGADO: Caja confirma pago
-    REGISTRADO --> ANULADO: cancelación
-    PAGADO --> EN_PREPARACION: Almacén atiende
-    EN_PREPARACION --> EN_DESPACHO: Distribución recoge
-    EN_DESPACHO --> ENTREGADO
+    PAGADO --> RESERVADO: Almacén reserva stock
+    RESERVADO --> EN_ENVIO: Distribución recoge
+    EN_ENVIO --> ENTREGADO
+    REGISTRADO --> ANULADO: cancelación (motivo obligatorio)
+    PAGADO --> ANULADO: cancelación (motivo obligatorio)
     ENTREGADO --> [*]
     ANULADO --> [*]
 ```
 
-## 5. Modelo de datos (propuesta)
+## 5. Modelo de datos
 
-Registros **propios** del módulo: pedido, detalle y estado. Clientes, artículos y catálogos SUNAT se **referencian** por su identificador, no se duplican.
+Registros **propios** del módulo (`I1T_*`): pedido, detalle, historial de estados y referencias externas. Clientes y artículos (`I1M_*`) son compartidos con los módulos Clientes y Almacén. Los catálogos SUNAT (`I1Z_*`) son referenciales. Las claves son códigos de texto estables, no autoincrementales.
 
 ```mermaid
 erDiagram
-    PEDIDO_VENTA_VIRTUAL ||--|{ DETALLE_PEDIDO : contiene
-    PEDIDO_VENTA_VIRTUAL ||--|{ HISTORIAL_ESTADO_PEDIDO : registra
-    ESTADO_PEDIDO ||--o{ HISTORIAL_ESTADO_PEDIDO : clasifica
-    CLIENTE ||--o{ PEDIDO_VENTA_VIRTUAL : realiza
-    ARTICULO ||--o{ DETALLE_PEDIDO : "se solicita en"
+    I1Z_TIPO_DOC_IDENTIDAD ||--o{ I1M_CLIENTE : clasifica
+    I1Z_UNIDAD_MEDIDA ||--o{ I1M_ARTICULO : mide
+    I1M_CLIENTE ||--o{ I1T_PEDIDO : realiza
+    I1Z_MONEDA ||--o{ I1T_PEDIDO : expresa
+    I1Z_MEDIO_PAGO ||--o{ I1T_PEDIDO : "se paga con"
+    I1Z_TIPO_COMPROBANTE ||--o{ I1T_PEDIDO : solicita
+    I1T_PEDIDO ||--|{ I1T_PEDIDO_DET : contiene
+    I1M_ARTICULO ||--o{ I1T_PEDIDO_DET : "se solicita en"
+    I1T_PEDIDO ||--|{ I1T_PEDIDO_EST_HIS : registra
+    I1T_PEDIDO ||--o{ I1T_REF_EXTERNA : "se vincula a"
 
-    PEDIDO_VENTA_VIRTUAL {
-        int id PK
-        string codigo_pedido
-        int cliente_id FK "módulo Clientes"
-        datetime fecha_pedido
-        string direccion_entrega
-        string moneda_cod "SUNAT Tabla 4"
-        string medio_pago_cod "SUNAT Tabla 1"
-        decimal subtotal
-        decimal total
-        string estado_actual
+    I1M_CLIENTE {
+        varchar64 CliCod PK
+        varchar32 DocIdeTip FK "Tabla 2 SUNAT"
+        varchar64 CliDocNum "UNIQUE con DocIdeTip"
+        varchar200 CliNom
+        varchar150 CliCor
+        varchar250 CliDirEnt
+        char1 CliEstReg "A / I / *"
     }
-    DETALLE_PEDIDO {
-        int id PK
-        int pedido_id FK
-        int articulo_id FK "módulo Almacén"
-        string unidad_medida_cod "SUNAT Tabla 6"
-        decimal cantidad
-        decimal precio_unitario
-        decimal subtotal
+    I1M_ARTICULO {
+        varchar64 ArtCod PK
+        varchar200 ArtNom
+        varchar16 UniMedCod FK "Tabla 6 SUNAT"
+        numeric ArtPreUni "14,2 > 0"
+        numeric ArtStkDis "12,2 >= 0"
+        char1 ArtEstReg "A / I / *"
     }
-    ESTADO_PEDIDO {
-        string codigo PK
-        string descripcion
+    I1T_PEDIDO {
+        varchar64 PedCod PK
+        varchar64 PedSolCod "UNIQUE, idempotencia"
+        varchar64 CliCod FK
+        date PedFecEmi
+        char3 MonCod FK "PEN"
+        varchar32 MedCod FK "Tabla 1 SUNAT"
+        varchar32 DocTipCod FK "01 Factura / 03 Boleta"
+        varchar250 PedDirEnt
+        numeric PedSubTot "14,2"
+        numeric PedIgvImp "14,2"
+        numeric PedTotImp "SubTot + Igv"
+        varchar24 PedEstAct "CHECK estados"
+        timestamptz PedRegIns
+        varchar128 PedRegAct
     }
-    HISTORIAL_ESTADO_PEDIDO {
-        int id PK
-        int pedido_id FK
-        string estado_codigo FK
-        datetime fecha
-        string origen "módulo que informa"
+    I1T_PEDIDO_DET {
+        varchar64 PedDetCod PK
+        varchar64 PedCod FK "UNIQUE con ArtCod"
+        varchar64 ArtCod FK
+        numeric DetCan "12,2 > 0"
+        numeric DetPreUni "14,2 congelado"
+        numeric DetSubLin "DetCan x DetPreUni"
     }
-    CLIENTE {
-        int id PK "externo"
+    I1T_PEDIDO_EST_HIS {
+        varchar64 HisEstCod PK
+        varchar64 PedCod FK
+        varchar24 HisEstAnt
+        varchar24 HisEstNue
+        varchar500 HisEstMot "obligatorio si ANULADO"
+        timestamptz HisRegIns
+        varchar128 HisRegAct
     }
-    ARTICULO {
-        int id PK "externo"
+    I1T_REF_EXTERNA {
+        varchar64 PedCod PK,FK
+        varchar32 RefTip PK "RESERVA_ALM / PAGO_CAJA / ..."
+        varchar128 RefExt PK "ID del módulo externo"
     }
 ```
 
-> Los nombres definitivos de tablas y campos los fija el **diccionario de datos** validado por el Product Owner.
+### Restricciones principales (se declaran en `Meta.constraints` y Django las crea en PostgreSQL)
 
-## 6. Tablas comunes (SUNAT) identificadas
+| Regla | Restricción |
+|-------|-------------|
+| RE_PedAltaIdem | `UNIQUE (PedSolCod)` |
+| RE_DetUnicoArt | `UNIQUE (PedCod, ArtCod)` |
+| RE_CliIdUni | `UNIQUE (DocIdeTip, CliDocNum)` |
+| RE_PedTotCuadre | `CHECK (PedTotImp = PedSubTot + PedIgvImp)` |
+| RE_DetSubCalc | `CHECK (DetSubLin = DetCan * DetPreUni)` |
+| RE_DetCanPos / RE_ArtStkVal | `CHECK (DetCan > 0)`, `CHECK (ArtStkDis >= 0)` |
+| RE_PedEstDom | `CHECK (PedEstAct IN ('REGISTRADO','PAGADO','RESERVADO','EN_ENVIO','ENTREGADO','ANULADO'))` |
+| RE_HisAnul | `CHECK (HisEstNue <> 'ANULADO' OR HisEstMot <> '')` |
+| RE_PedAltaAtom | Cabecera, detalle e historial inicial en un solo `transaction.atomic` |
 
-| Tabla | Uso propuesto | Tipo de uso |
-|-------|---------------|-------------|
-| Tabla 1 · Tipo de medio de pago | Medio de pago seleccionado | Directo |
-| Tabla 2 · Tipo de documento de identidad | Identificación del comprador | Vía Clientes |
-| Tabla 3 · Entidad financiera | Bancos cuando corresponda | Vía Caja |
-| Tabla 4 · Tipo de moneda | Moneda de la operación | Directo |
-| Tabla 5 · Tipo de existencia | Consulta indirecta | Vía Almacén |
-| Tabla 6 · Código de unidad de medida | Unidades de los artículos | Directo |
-| Tabla 10 · Tipo de comprobante | Relación venta–comprobante | Vía Comprobantes |
-| Tabla 12 · Tipo de operación | Por verificar | Pendiente |
-| Tabla 13 · Catálogo de existencias | Por coordinar | Vía Almacén |
-| Tabla 17 · Plan de cuentas | Integración contable | Vía Tribu Financiera |
+Las reglas que dependen de otros módulos (stock en Almacén, Factura con RUC) se validan en el backend dentro de la transacción.
+
+## 6. Tablas comunes (SUNAT)
+
+| Tabla SUNAT | Tabla del módulo | Uso | Tipo de uso |
+|-------------|------------------|-----|-------------|
+| Tabla 1 · Tipo de medio de pago | `I1Z_MEDIO_PAGO` | Medio de pago del pedido | Directo |
+| Tabla 2 · Tipo de documento de identidad | `I1Z_TIPO_DOC_IDENTIDAD` | Identificación del comprador | Directo |
+| Tabla 3 · Entidad financiera | — | Bancos cuando corresponda | Vía Caja |
+| Tabla 4 · Tipo de moneda | `I1Z_MONEDA` | Moneda del pedido (PEN) | Directo |
+| Tabla 5 · Tipo de existencia | — | Consulta indirecta | Vía Almacén |
+| Tabla 6 · Código de unidad de medida | `I1Z_UNIDAD_MEDIDA` | Unidad de los artículos | Directo |
+| Tabla 10 · Tipo de comprobante | `I1Z_TIPO_COMPROBANTE` | Boleta (03) o Factura (01) solicitada | Directo |
+| Tabla 12 · Tipo de operación | — | Por verificar | Pendiente |
+| Tabla 13 · Catálogo de existencias | `I1M_ARTICULO` | Catálogo de la tienda virtual | Compartido con Almacén |
+| Tabla 17 · Plan de cuentas | — | Integración contable | Vía Tribu Financiera |
 
 ## 7. API REST inicial (borrador para el CRUD)
 
@@ -191,9 +234,25 @@ erDiagram
 |--------|----------|-------------|----|
 | GET | `/api/productos/` | Lista de artículos disponibles | RF-01, RF-09 |
 | GET | `/api/pedidos/` | Lista de pedidos (filtros por estado, fecha, cliente) | RF-07 |
-| POST | `/api/pedidos/` | Registra pedido con su detalle | RF-04, RF-05, RF-06 |
+| POST | `/api/pedidos/` | Registra pedido con su detalle; `PedSolCod` evita duplicados | RF-04, RF-05, RF-06 |
 | GET | `/api/pedidos/{id}/` | Consulta un pedido y su detalle | RF-07 |
 | PUT/PATCH | `/api/pedidos/{id}/` | Actualiza un pedido en estado REGISTRADO | RF-06 |
-| DELETE | `/api/pedidos/{id}/` | Anula el pedido (cambio de estado, no borrado físico) | RF-06 |
+| DELETE | `/api/pedidos/{id}/` | Anula el pedido (cambio a ANULADO con motivo obligatorio, no borrado físico) | RF-06 |
 | GET | `/api/pedidos/{id}/estados/` | Historial de estados | RF-08 |
 | POST | `/api/pedidos/{id}/estados/` | Registra un cambio de estado informado por otro módulo | RF-10 |
+
+La documentación de los endpoints se genera con **drf-spectacular** (Swagger UI).
+
+## 8. Decisión de tecnologías
+
+La comparación completa de alternativas está en el documento *Arquitectura del módulo — Comparación de tecnologías y decisión del equipo*.
+
+| Componente | Tecnología |
+|------------|------------|
+| Base de datos | PostgreSQL |
+| Backend | Python + Django REST Framework |
+| Acceso a datos | ORM de Django con migraciones (`Meta.db_table` y `db_column` con los nombres del diccionario) |
+| Scripts SQL | `01_estructura.sql` generado con `sqlmigrate`; `02_datos_prueba.sql` escrito aparte |
+| Documentación de servicios | drf-spectacular (Swagger) |
+| Frontend | React + Vite + TypeScript, Tailwind CSS, Axios |
+| Pruebas | pytest, pytest-django y Postman |
