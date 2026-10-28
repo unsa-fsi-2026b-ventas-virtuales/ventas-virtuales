@@ -332,7 +332,7 @@ export function App() {
     }
   };
 
-  const colorEstado = (estado: EstadoPedido) => {
+  const colorEstado = (estado: EstadoPedido | string) => {
     switch (estado) {
       case 'REGISTRADO':
         return 'bg-blue-100 text-blue-800 border-blue-300';
@@ -346,6 +346,8 @@ export function App() {
         return 'bg-green-200 text-green-900 border-green-400';
       case 'ANULADO':
         return 'bg-red-100 text-red-800 border-red-300';
+      default:
+        return 'bg-slate-100 text-slate-800 border-slate-300';
     }
   };
 
